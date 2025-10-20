@@ -1,4 +1,5 @@
-﻿using GatewayService.Services;
+﻿using GatewayService.Models;
+using GatewayService.Services;
 using Microsoft.AspNetCore.Mvc;
 
 namespace GatewayService.Controllers;
@@ -26,9 +27,23 @@ public class FlightsController : ControllerBase
 
         var response = await _gatewayService.GetFlightsAsync(page, size);
         
-        if (response.IsSuccess)
+        if (response is { IsSuccess: true, Response: not null })
         {
-            return Ok(response.Response);
+            var result = new PaginationResponse<FlightResponse>
+            {
+                Page = response.Response.Page,
+                PageSize = response.Response.PageSize,
+                TotalElements = response.Response.TotalElements,
+                Items = response.Response.Items.Select(f => new FlightResponse
+                {
+                    Date = f.Date,
+                    FlightNumber = f.FlightNumber,
+                    FromAirport = f.FromAirport.City + " " + f.FromAirport.Name,
+                    ToAirport = f.ToAirport.City + " " + f.ToAirport.Name,
+                    Price = f.Price,
+                }).ToList()
+            };
+            return Ok(result);
         }
         
         var errorMessage = response.Error?.Message ?? "Service error";
