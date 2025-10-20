@@ -174,7 +174,7 @@ public class GatewayService : IGatewayService
                 await _ticketClient.CancelTicketAsync(username, ticket.TicketUid);
                 
                 return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse(
-                    "Bonus Service unavailable, purchase rolled back", 503);
+                    "Bonus Service unavailable", 503);
             }
 
             // 6. Получить обновленные бонусы (не критично)
