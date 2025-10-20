@@ -26,19 +26,20 @@ public class PrivilegeController : ControllerBase
             return BadRequest(new { message = "Username is required" });
         }
 
-        try
+        var response = await _gatewayService.GetPrivilegeInfoAsync(username);
+        
+        if (response.IsSuccess)
         {
-            var privilegeInfo = await _gatewayService.GetPrivilegeInfoAsync(username);
-            return Ok(privilegeInfo ?? new PrivilegeInfoResponse { Balance = 0, Status = "BRONZE", History = new List<BalanceHistory>() });
+            return Ok(response.Response);
         }
-        catch (ServiceUnavailableException)
+        
+        // Для /api/v1/privilege возвращаем 503 при недоступности BonusService
+        if (response.StatusCode == 503)
         {
             return StatusCode(503, new { message = "Bonus service unavailable" });
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting privilege info for: {Username}", username);
-            return StatusCode(500, new { message = "Internal server error" });
-        }
+        
+        var errorMessage = response.Error?.Message ?? "Service error";
+        return StatusCode(response.StatusCode, new { message = errorMessage });
     }
 }

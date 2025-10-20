@@ -1,6 +1,7 @@
 ﻿using GatewayService.Models;
 using System.Text;
 using System.Text.Json;
+using GatewayService.Dto;
 
 namespace GatewayService.HttpClients;
 
@@ -15,9 +16,24 @@ public class TicketClient : ITicketClient
         _httpClient = httpClient;
         _logger = logger;
         _circuitBreaker = circuitBreaker;
+        
+        _circuitBreaker.RegisterHealthCheck("TicketService", HealthCheckAsync);
     }
 
-    public async Task<List<TicketResponse>> GetUserTicketsAsync(string username)
+    private async Task<bool> HealthCheckAsync()
+    {
+        try
+        {
+            var response = await _httpClient.GetAsync("/manage/health");
+            return response.IsSuccessStatusCode;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    public async Task<ServiceResponse<List<TicketResponse>>> GetUserTicketsAsync(string username)
     {
         return await _circuitBreaker.ExecuteAsync(
             "TicketService",
@@ -30,23 +46,21 @@ public class TicketClient : ITicketClient
                 if (response.IsSuccessStatusCode)
                 {
                     var content = await response.Content.ReadAsStringAsync();
-                    return JsonSerializer.Deserialize<List<TicketResponse>>(content, new JsonSerializerOptions
+                    var tickets = JsonSerializer.Deserialize<List<TicketResponse>>(content, new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true
                     }) ?? new List<TicketResponse>();
+                    return ServiceResponse<List<TicketResponse>>.Success(tickets);
                 }
-
-                _logger.LogWarning("Failed to get tickets for user: {Username}", username);
-                throw new HttpRequestException($"Failed to get tickets: {response.StatusCode}");
+                
+                return ServiceResponse<List<TicketResponse>>.ErrorResponse(
+                    $"Failed to get tickets: {response.StatusCode}", 
+                    (int)response.StatusCode);
             },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for GetUserTicketsAsync for user: {Username}", username);
-                return new List<TicketResponse>();
-            });
+            ServiceResponse<List<TicketResponse>>.ServiceUnavailable("Ticket"));
     }
 
-    public async Task<TicketResponse?> GetTicketAsync(string username, Guid ticketUid)
+    public async Task<ServiceResponse<TicketResponse?>> GetTicketAsync(string username, Guid ticketUid)
     {
         return await _circuitBreaker.ExecuteAsync(
             "TicketService",
@@ -59,23 +73,26 @@ public class TicketClient : ITicketClient
                 if (response.IsSuccessStatusCode)
                 {
                     var content = await response.Content.ReadAsStringAsync();
-                    return JsonSerializer.Deserialize<TicketResponse>(content, new JsonSerializerOptions
+                    var ticket = JsonSerializer.Deserialize<TicketResponse>(content, new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true
                     });
+                    return ServiceResponse<TicketResponse?>.Success(ticket);
                 }
-
-                _logger.LogWarning("Ticket not found: {TicketUid} for user: {Username}", ticketUid, username);
-                throw new HttpRequestException($"Ticket not found: {response.StatusCode}");
+                
+                if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    return ServiceResponse<TicketResponse?>.Success(null);
+                }
+                
+                return ServiceResponse<TicketResponse?>.ErrorResponse(
+                    $"Failed to get ticket: {response.StatusCode}", 
+                    (int)response.StatusCode);
             },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for GetTicketAsync for user: {Username}", username);
-                return null;
-            });
+            ServiceResponse<TicketResponse?>.ServiceUnavailable("Ticket"));
     }
 
-    public async Task<TicketPurchaseResponse?> PurchaseTicketAsync(string username, TicketPurchaseRequest request)
+    public async Task<ServiceResponse<TicketPurchaseResponse?>> PurchaseTicketAsync(string username, TicketPurchaseRequest request)
     {
         return await _circuitBreaker.ExecuteAsync(
             "TicketService",
@@ -94,24 +111,21 @@ public class TicketClient : ITicketClient
                 if (response.IsSuccessStatusCode)
                 {
                     var responseContent = await response.Content.ReadAsStringAsync();
-                    return JsonSerializer.Deserialize<TicketPurchaseResponse>(responseContent, new JsonSerializerOptions
+                    var ticketResponse = JsonSerializer.Deserialize<TicketPurchaseResponse>(responseContent, new JsonSerializerOptions
                     {
                         PropertyNameCaseInsensitive = true
                     });
+                    return ServiceResponse<TicketPurchaseResponse?>.Success(ticketResponse);
                 }
-
-                _logger.LogWarning("Failed to purchase ticket for user: {Username}. Status: {StatusCode}",
-                    username, response.StatusCode);
-                throw new HttpRequestException($"Failed to purchase ticket: {response.StatusCode}");
+                
+                return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse(
+                    $"Failed to purchase ticket: {response.StatusCode}", 
+                    (int)response.StatusCode);
             },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for PurchaseTicketAsync for user: {Username}", username);
-                return null;
-            });
+            ServiceResponse<TicketPurchaseResponse?>.ServiceUnavailable("Ticket"));
     }
 
-    public async Task<bool> CancelTicketAsync(string username, Guid ticketUid)
+    public async Task<ServiceResponse<bool>> CancelTicketAsync(string username, Guid ticketUid)
     {
         return await _circuitBreaker.ExecuteAsync(
             "TicketService",
@@ -121,16 +135,20 @@ public class TicketClient : ITicketClient
                 request.Headers.Add("X-User-Name", username);
 
                 var response = await _httpClient.SendAsync(request);
-                if (!response.IsSuccessStatusCode)
+                if (response.IsSuccessStatusCode)
                 {
-                    throw new HttpRequestException($"Failed to cancel ticket: {response.StatusCode}");
+                    return ServiceResponse<bool>.Success(true);
                 }
-                return true;
+                
+                if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    return ServiceResponse<bool>.Success(false);
+                }
+                
+                return ServiceResponse<bool>.ErrorResponse(
+                    $"Failed to cancel ticket: {response.StatusCode}", 
+                    (int)response.StatusCode);
             },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for CancelTicketAsync for user: {Username}", username);
-                return false;
-            });
+            ServiceResponse<bool>.ServiceUnavailable("Ticket"));
     }
 }

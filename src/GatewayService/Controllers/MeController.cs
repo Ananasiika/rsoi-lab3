@@ -25,20 +25,14 @@ public class MeController : ControllerBase
             return BadRequest(new { message = "Username is required" });
         }
 
-        try
+        var response = await _gatewayService.GetUserInfoAsync(username);
+        
+        if (response.IsSuccess)
         {
-            var userInfo = await _gatewayService.GetUserInfoAsync(username);
-            return Ok(userInfo);
+            return Ok(response.Response);
         }
-        catch (ServiceUnavailableException ex)
-        {
-            _logger.LogWarning(ex, "Critical service unavailable for user: {Username}", username);
-            return StatusCode(503, new { message = "Service unavailable" });
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error getting user info for: {Username}", username);
-            return StatusCode(500, new { message = "Internal server error" });
-        }
+        
+        var errorMessage = response.Error?.Message ?? "Service error";
+        return StatusCode(response.StatusCode, new { message = errorMessage });
     }
 }

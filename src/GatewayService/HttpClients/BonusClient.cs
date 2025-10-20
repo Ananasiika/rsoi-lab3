@@ -1,9 +1,9 @@
 ﻿using GatewayService.Models;
 using System.Text;
 using System.Text.Json;
+using GatewayService.Dto;
 
 namespace GatewayService.HttpClients;
-
 public class BonusClient : IBonusClient
 {
     private readonly HttpClient _httpClient;
@@ -15,66 +15,85 @@ public class BonusClient : IBonusClient
         _httpClient = httpClient;
         _logger = logger;
         _circuitBreaker = circuitBreaker;
+        
+        _circuitBreaker.RegisterHealthCheck("BonusService", HealthCheckAsync);
     }
 
-    public async Task<PrivilegeInfoResponse?> GetPrivilegeInfoAsync(string username)
+    private async Task<bool> HealthCheckAsync()
     {
         try
         {
-            return await _circuitBreaker.ExecuteAsync(
-                "BonusService",
-                async () =>
-                {
-                    var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/privilege");
-                    request.Headers.Add("X-User-Name", username);
-
-                    var response = await _httpClient.SendAsync(request);
-                    if (response.IsSuccessStatusCode)
-                    {
-                        var content = await response.Content.ReadAsStringAsync();
-                        return JsonSerializer.Deserialize<PrivilegeInfoResponse>(content, new JsonSerializerOptions
-                        {
-                            PropertyNameCaseInsensitive = true
-                        });
-                    }
-                    
-                    _logger.LogWarning("Failed to get privilege info for user: {Username}", username);
-                    throw new HttpRequestException($"Failed to get privilege info: {response.StatusCode}");
-                },
-                () => throw new ServiceUnavailableException("Bonus service unavailable"));
+            var response = await _httpClient.GetAsync("/manage/health");
+            return response.IsSuccessStatusCode;
         }
-        catch (ServiceUnavailableException)
+        catch
         {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Unexpected error in GetPrivilegeInfoAsync for user: {Username}", username);
-            throw new ServiceUnavailableException("Bonus service unavailable", ex);
+            return false;
         }
     }
 
-    public async Task<PrivilegeShortInfo?> GetPrivilegeShortInfoAsync(string username)
+    public async Task<ServiceResponse<PrivilegeInfoResponse?>> GetPrivilegeInfoAsync(string username)
     {
-        try
-        {
-            var privilegeInfo = await GetPrivilegeInfoAsync(username);
-            return privilegeInfo != null ? new PrivilegeShortInfo
+        return await _circuitBreaker.ExecuteAsync(
+            "BonusService",
+            async () =>
             {
-                Balance = privilegeInfo.Balance,
-                Status = privilegeInfo.Status
-            } : null;
-        }
-        catch (ServiceUnavailableException)
-        {
-            _logger.LogWarning("Bonus service unavailable for GetPrivilegeShortInfoAsync, returning null");
-            return null;
-        }
+                var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/privilege");
+                request.Headers.Add("X-User-Name", username);
+
+                var response = await _httpClient.SendAsync(request);
+                if (response.IsSuccessStatusCode)
+                {
+                    var content = await response.Content.ReadAsStringAsync();
+                    var privilegeInfo = JsonSerializer.Deserialize<PrivilegeInfoResponse>(content, new JsonSerializerOptions
+                    {
+                        PropertyNameCaseInsensitive = true
+                    });
+                    return ServiceResponse<PrivilegeInfoResponse?>.Success(privilegeInfo);
+                }
+                
+                if (response.StatusCode == System.Net.HttpStatusCode.NotFound)
+                {
+                    return ServiceResponse<PrivilegeInfoResponse?>.Success(new PrivilegeInfoResponse
+                    {
+                        Balance = 0,
+                        Status = "BRONZE",
+                        History = new List<BalanceHistory>()
+                    });
+                }
+                
+                return ServiceResponse<PrivilegeInfoResponse?>.ErrorResponse(
+                    $"Failed to get privilege info: {response.StatusCode}", 
+                    (int)response.StatusCode);
+            },
+            ServiceResponse<PrivilegeInfoResponse?>.ServiceUnavailable("Bonus"));
     }
 
-    public async Task UpdatePrivilegeAfterPurchase(string username, TicketPurchaseRequest request, Guid ticketUid, int paidByBonuses, int paidByMoney, int bonusToAdd = 0)
+    public async Task<ServiceResponse<PrivilegeShortInfo?>> GetPrivilegeShortInfoAsync(string username)
     {
-        await _circuitBreaker.ExecuteAsync(
+        var result = await GetPrivilegeInfoAsync(username);
+        
+        if (result.IsSuccess)
+        {
+            var shortInfo = new PrivilegeShortInfo
+            {
+                Balance = result.Response?.Balance ?? 0,
+                Status = result.Response?.Status ?? "BRONZE"
+            };
+            return ServiceResponse<PrivilegeShortInfo?>.Success(shortInfo);
+        }
+
+        // Для некритичных операций возвращаем fallback
+        return ServiceResponse<PrivilegeShortInfo?>.Fallback(new PrivilegeShortInfo 
+        { 
+            Balance = 0, 
+            Status = "BRONZE" 
+        });
+    }
+
+    public async Task<ServiceResponse<bool>> UpdatePrivilegeAfterPurchase(string username, TicketPurchaseRequest request, Guid ticketUid, int paidByBonuses, int paidByMoney, int bonusToAdd = 0)
+    {
+        return await _circuitBreaker.ExecuteAsync(
             "BonusService",
             async () =>
             {
@@ -99,29 +118,23 @@ public class BonusClient : IBonusClient
                 httpRequest.Headers.Add("X-User-Name", username);
 
                 var response = await _httpClient.SendAsync(httpRequest);
-
-                if (!response.IsSuccessStatusCode)
+                
+                if (response.IsSuccessStatusCode)
                 {
-                    _logger.LogWarning("Failed to update privilege after purchase for user: {Username}. Status: {StatusCode}",
-                        username, response.StatusCode);
-                    throw new HttpRequestException($"Failed to update privilege: {response.StatusCode}");
+                    _logger.LogInformation("Successfully updated privilege for user {Username} after purchase", username);
+                    return ServiceResponse<bool>.Success(true);
                 }
-                else
-                {
-                    _logger.LogInformation("Successfully updated privilege for user {Username} after purchase. Ticket: {TicketUid}, PaidByBonuses: {PaidByBonuses}, BonusToAdd: {BonusToAdd}",
-                        username, ticketUid, paidByBonuses, bonusToAdd);
-                }
+                
+                return ServiceResponse<bool>.ErrorResponse(
+                    $"Failed to update privilege: {response.StatusCode}", 
+                    (int)response.StatusCode);
             },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for UpdatePrivilegeAfterPurchase for user: {Username}", username);
-                throw new Exception("Bonus service unavailable");
-            });
+            ServiceResponse<bool>.ServiceUnavailable("Bonus"));
     }
 
-    public async Task UpdatePrivilegeAfterCancel(string username, Guid ticketUid)
+    public async Task<ServiceResponse<bool>> UpdatePrivilegeAfterCancel(string username, Guid ticketUid)
     {
-        await _circuitBreaker.ExecuteAsync(
+        return await _circuitBreaker.ExecuteAsync(
             "BonusService",
             async () =>
             {
@@ -140,22 +153,17 @@ public class BonusClient : IBonusClient
                 httpRequest.Headers.Add("X-User-Name", username);
 
                 var response = await _httpClient.SendAsync(httpRequest);
-
-                if (!response.IsSuccessStatusCode)
+                
+                if (response.IsSuccessStatusCode)
                 {
-                    _logger.LogWarning("Failed to update privilege after cancel for user: {Username}. Status: {StatusCode}",
-                        username, response.StatusCode);
+                    _logger.LogInformation("Successfully updated privilege for user {Username} after cancel", username);
+                    return ServiceResponse<bool>.Success(true);
                 }
-                else
-                {
-                    _logger.LogInformation("Successfully updated privilege for user {Username} after cancel. Ticket: {TicketUid}",
-                        username, ticketUid);
-                }
+                
+                return ServiceResponse<bool>.ErrorResponse(
+                    $"Failed to update privilege: {response.StatusCode}", 
+                    (int)response.StatusCode);
             },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for UpdatePrivilegeAfterCancel for user: {Username}", username);
-                throw new Exception("Bonus service unavailable");
-            });
+            ServiceResponse<bool>.ServiceUnavailable("Bonus"));
     }
 }

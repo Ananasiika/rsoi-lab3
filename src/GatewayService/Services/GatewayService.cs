@@ -21,75 +21,219 @@ public class GatewayService : IGatewayService
     {
         _flightClient = flightClient;
         _bonusClient = bonusClient;
-        _retryQueue = retryQueue;
         _ticketClient = ticketClient;
+        _retryQueue = retryQueue;
         _logger = logger;
     }
 
-    public Task<PaginationResponse<FlightDto>> GetFlightsAsync(int page, int size)
+    public Task<ServiceResponse<PaginationResponse<FlightDto>>> GetFlightsAsync(int page, int size)
     {
         return _flightClient.GetFlightsAsync(page, size);
     }
 
-    public async Task<UserInfoResponse> GetUserInfoAsync(string username)
+    public async Task<ServiceResponse<UserInfoResponse>> GetUserInfoAsync(string username)
     {
-        List<TicketResponse> tickets;
-        try
+        // 1. Tickets - критичный сервис
+        var ticketsResponse = await _ticketClient.GetUserTicketsAsync(username);
+        if (!ticketsResponse.IsSuccess)
         {
-            tickets = await _ticketClient.GetUserTicketsAsync(username);
+            return ServiceResponse<UserInfoResponse>.ErrorResponse(
+                ticketsResponse.Error?.Message ?? "Ticket service error", 
+                ticketsResponse.StatusCode);
         }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Ticket service unavailable for user: {Username}", username);
-            throw new ServiceUnavailableException("Ticket service unavailable", ex);
-        }
+
         var result = new List<TicketResponse>();
 
-        foreach (var ticket in tickets)
+        foreach (var ticket in ticketsResponse.Response ?? new List<TicketResponse>())
         {
-            // 2. Flight info - критичный, но с fallback
-            try
+            // 2. Flight info - с fallback
+            var flightResponse = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
+            if (flightResponse.IsSuccess && flightResponse.Response != null)
             {
-                var flight = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
-                if (flight != null)
-                {
-                    result.Add(CreateTicketResponse(ticket, flight));
-                }
-                else
-                {
-                    result.Add(CreateFallbackTicketResponse(ticket));
-                }
+                result.Add(CreateTicketResponse(ticket, flightResponse.Response));
             }
-            catch (Exception ex)
+            else
             {
-                _logger.LogWarning(ex, "Flight service unavailable for ticket: {TicketUid}, using fallback", ticket.TicketUid);
                 result.Add(CreateFallbackTicketResponse(ticket));
             }
         }
 
-        // 3. Privilege - НЕ критичный, всегда fallback при ошибках
-        PrivilegeShortInfo privilege;
-        try
-        {
-            var privilegeInfo = await _bonusClient.GetPrivilegeShortInfoAsync(username);
-            privilege = new PrivilegeShortInfo
-            {
-                Balance = privilegeInfo?.Balance ?? 0,
-                Status = privilegeInfo?.Status ?? "BRONZE"
-            };
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Bonus service unavailable for user: {Username}, using fallback", username);
-            privilege = new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
-        }
+        // 3. Privilege - всегда fallback при ошибках
+        var privilegeResponse = await _bonusClient.GetPrivilegeShortInfoAsync(username);
+        var privilege = privilegeResponse.Response ?? new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
 
-        return new UserInfoResponse
+        return ServiceResponse<UserInfoResponse>.Success(new UserInfoResponse
         {
             Tickets = result,
             Privilege = privilege
-        };
+        });
     }
+
+    public async Task<ServiceResponse<List<TicketResponse>>> GetUserTicketsAsync(string username)
+    {
+        var ticketsResponse = await _ticketClient.GetUserTicketsAsync(username);
+        if (!ticketsResponse.IsSuccess)
+        {
+            return ServiceResponse<List<TicketResponse>>.ErrorResponse(
+                ticketsResponse.Error?.Message ?? "Ticket service error", 
+                ticketsResponse.StatusCode);
+        }
+
+        var result = new List<TicketResponse>();
+
+        foreach (var ticket in ticketsResponse.Response ?? new List<TicketResponse>())
+        {
+            var flightResponse = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
+            if (flightResponse.IsSuccess && flightResponse.Response != null)
+            {
+                result.Add(CreateTicketResponse(ticket, flightResponse.Response));
+            }
+            else
+            {
+                result.Add(CreateFallbackTicketResponse(ticket));
+            }
+        }
+
+        return ServiceResponse<List<TicketResponse>>.Success(result);
+    }
+
+    public async Task<ServiceResponse<TicketResponse?>> GetTicketAsync(string username, Guid ticketUid)
+    {
+        var ticketResponse = await _ticketClient.GetTicketAsync(username, ticketUid);
+        if (!ticketResponse.IsSuccess || ticketResponse.Response == null)
+        {
+            return ticketResponse;
+        }
+
+        var flightResponse = await _flightClient.GetFlightByNumberAsync(ticketResponse.Response.FlightNumber);
+        if (flightResponse.IsSuccess && flightResponse.Response != null)
+        {
+            var fullTicket = CreateTicketResponse(ticketResponse.Response, flightResponse.Response);
+            return ServiceResponse<TicketResponse?>.Success(fullTicket);
+        }
+        else
+        {
+            var fallbackTicket = CreateFallbackTicketResponse(ticketResponse.Response);
+            return ServiceResponse<TicketResponse?>.Success(fallbackTicket);
+        }
+    }
+
+    public async Task<ServiceResponse<TicketPurchaseResponse?>> PurchaseTicketAsync(string username, TicketPurchaseRequest request)
+    {
+        try
+        {
+            _logger.LogInformation("Starting ticket purchase for user: {Username}, flight: {FlightNumber}", 
+                username, request.FlightNumber);
+
+            // 1. FlightService - критичный
+            var flightResponse = await _flightClient.GetFlightByNumberAsync(request.FlightNumber);
+            if (!flightResponse.IsSuccess || flightResponse.Response == null)
+            {
+                var errorMsg = flightResponse.Error?.Message ?? "Flight not found";
+                return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse(errorMsg, flightResponse.StatusCode);
+            }
+
+            var flight = flightResponse.Response;
+
+            // 2. BonusService - не критичный
+            var privilegeResponse = await _bonusClient.GetPrivilegeShortInfoAsync(username);
+            var privilegeInfo = privilegeResponse.Response;
+
+            // 3. Рассчитать суммы оплаты
+            int paidByMoney, paidByBonuses, bonusToAdd;
+            CalculatePaidAmounts(request, privilegeInfo, out paidByBonuses, out paidByMoney, out bonusToAdd);
+
+            // 4. TicketService - критичный
+            var ticketResponse = await _ticketClient.PurchaseTicketAsync(username, request);
+            if (!ticketResponse.IsSuccess || ticketResponse.Response == null)
+            {
+                var errorMsg = ticketResponse.Error?.Message ?? "Failed to create ticket";
+                return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse(errorMsg, ticketResponse.StatusCode);
+            }
+
+            var ticket = ticketResponse.Response;
+
+            // 5. BonusService update - не критичный, но при ошибке откатываем
+            var bonusUpdateResponse = await _bonusClient.UpdatePrivilegeAfterPurchase(
+                username, request, ticket.TicketUid, paidByBonuses, paidByMoney, bonusToAdd);
+
+            if (!bonusUpdateResponse.IsSuccess)
+            {
+                _logger.LogWarning("Failed to update bonus system, rolling back ticket creation");
+                
+                // Откат билета
+                await _ticketClient.CancelTicketAsync(username, ticket.TicketUid);
+                
+                return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse(
+                    "Bonus service unavailable, purchase rolled back", 503);
+            }
+
+            // 6. Получить обновленные бонусы (не критично)
+            var updatedPrivilegeResponse = await _bonusClient.GetPrivilegeShortInfoAsync(username);
+            var updatedPrivilege = updatedPrivilegeResponse.Response ?? new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
+
+            var purchaseResponse = new TicketPurchaseResponse
+            {
+                TicketUid = ticket.TicketUid,
+                FlightNumber = flight.FlightNumber,
+                FromAirport = FormatAirport(flight.FromAirport),
+                ToAirport = FormatAirport(flight.ToAirport),
+                Date = flight.Date,
+                Price = request.Price,
+                PaidByMoney = paidByMoney,
+                PaidByBonuses = paidByBonuses,
+                Status = "PAID",
+                Privilege = updatedPrivilege
+            };
+
+            return ServiceResponse<TicketPurchaseResponse?>.Success(purchaseResponse);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error purchasing ticket for user: {Username}", username);
+            return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse("Internal server error", 500);
+        }
+    }
+
+    public async Task<ServiceResponse<bool>> CancelTicketAsync(string username, Guid ticketUid)
+    {
+        // 1. Отменяем билет - критичный
+        var cancelResponse = await _ticketClient.CancelTicketAsync(username, ticketUid);
+        if (!cancelResponse.IsSuccess)
+        {
+            return cancelResponse;
+        }
+
+        // 2. Обновляем бонусный счет - не критичный, идет в retry queue при ошибке
+        var bonusResponse = await _bonusClient.UpdatePrivilegeAfterCancel(username, ticketUid);
+        if (!bonusResponse.IsSuccess)
+        {
+            _logger.LogWarning("Bonus service unavailable for cancel operation, adding to retry queue");
+            
+            // Добавляем в retry queue
+            _retryQueue.Enqueue(new RetryItem
+            {
+                OperationType = "UpdatePrivilegeAfterCancel",
+                Username = username,
+                Data = new { TicketUid = ticketUid },
+                Action = async () =>
+                {
+                    var retryResponse = await _bonusClient.UpdatePrivilegeAfterCancel(username, ticketUid);
+                    return retryResponse.IsSuccess;
+                }
+            });
+        }
+
+        return ServiceResponse<bool>.Success(true);
+    }
+
+    public Task<ServiceResponse<PrivilegeInfoResponse?>> GetPrivilegeInfoAsync(string username)
+    {
+        // Этот метод критичный - пробрасываем ошибки от BonusService
+        return _bonusClient.GetPrivilegeInfoAsync(username);
+    }
+
+    // Вспомогательные методы
     private TicketResponse CreateTicketResponse(TicketResponse ticket, FlightDto flight)
     {
         return new TicketResponse
@@ -122,222 +266,25 @@ public class GatewayService : IGatewayService
     {
         if (airport == null)
             return "Unknown Airport";
-    
+        
         var parts = new List<string>();
-    
+        
         if (!string.IsNullOrEmpty(airport.City))
             parts.Add(airport.City);
-        
+            
         if (!string.IsNullOrEmpty(airport.Name))
             parts.Add(airport.Name);
-    
+        
         return parts.Any() ? string.Join(" ", parts) : "Unknown Airport";
-    }
-
-    public async Task<List<TicketResponse>> GetUserTicketsAsync(string username)
-    {
-        // 1. Получаем билеты из TicketService
-        var tickets = await _ticketClient.GetUserTicketsAsync(username);
-
-        var result = new List<TicketResponse>();
-
-        foreach (var ticket in tickets)
-        {
-            // 2. Для каждого билета получаем информацию о рейсе из FlightService
-            var flight = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
-
-            if (flight != null)
-            {
-                var ticketResponse = new TicketResponse
-                {
-                    TicketUid = ticket.TicketUid,
-                    FlightNumber = ticket.FlightNumber,
-                    FromAirport = $"{flight.FromAirport.City} {flight.FromAirport.Name}",
-                    ToAirport = $"{flight.ToAirport.City} {flight.ToAirport.Name}",
-                    Date = flight.Date,
-                    Price = ticket.Price,
-                    Status = ticket.Status
-                };
-                result.Add(ticketResponse);
-            }
-            else
-            {
-                // Если информация о рейсе не найдена, возвращаем базовую информацию
-                var ticketResponse = new TicketResponse
-                {
-                    TicketUid = ticket.TicketUid,
-                    FlightNumber = ticket.FlightNumber,
-                    FromAirport = "Unknown",
-                    ToAirport = "Unknown",
-                    Date = DateTime.MinValue,
-                    Price = ticket.Price,
-                    Status = ticket.Status
-                };
-                result.Add(ticketResponse);
-            }
-        }
-
-        return result;
-    }
-
-    public async Task<TicketResponse?> GetTicketAsync(string username, Guid ticketUid)
-    {
-        // 1. Получаем билет из TicketService
-        var ticket = await _ticketClient.GetTicketAsync(username, ticketUid);
-        if (ticket == null) return null;
-
-        // 2. Получаем информацию о рейсе из FlightService
-        var flight = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
-
-        if (flight == null) return null;
-
-        return new TicketResponse
-        {
-            TicketUid = ticket.TicketUid,
-            FlightNumber = ticket.FlightNumber,
-            FromAirport = $"{flight.FromAirport.City} {flight.FromAirport.Name}",
-            ToAirport = $"{flight.ToAirport.City} {flight.ToAirport.Name}",
-            Date = flight.Date,
-            Price = ticket.Price,
-            Status = ticket.Status
-        };
-    }
-
-    public async Task<TicketPurchaseResponse?> PurchaseTicketAsync(string username, TicketPurchaseRequest request)
-    {
-        try
-        {
-            _logger.LogInformation("Starting ticket purchase for user: {Username}, flight: {FlightNumber}",
-                username, request.FlightNumber);
-
-            // 1. Получить информацию о полете
-            var flight = await _flightClient.GetFlightByNumberAsync(request.FlightNumber);
-            if (flight == null)
-            {
-                _logger.LogWarning("Flight not found: {FlightNumber}", request.FlightNumber);
-                return null;
-            }
-
-            // 2. Получить информацию о бонусах
-            var privilegeInfo = await _bonusClient.GetPrivilegeShortInfoAsync(username);
-
-            // 3. Рассчитать суммы оплаты и бонусы
-            int paidByMoney, paidByBonuses, bonusToAdd;
-            CalculatePaidAmounts(request, privilegeInfo, out paidByBonuses, out paidByMoney, out bonusToAdd);
-
-            // 4. Создать запрос на покупку билета в TicketService
-            var ticketPurchaseRequest = new TicketPurchaseRequest
-            {
-                FlightNumber = request.FlightNumber,
-                Price = request.Price,
-                PaidFromBalance = request.PaidFromBalance
-            };
-
-            var ticketResponse = await _ticketClient.PurchaseTicketAsync(username, ticketPurchaseRequest);
-            if (ticketResponse == null)
-            {
-                _logger.LogWarning("Failed to create ticket in TicketService");
-                return null;
-            }
-
-            // 5. Обновить бонусную систему
-            try
-            {
-                await _bonusClient.UpdatePrivilegeAfterPurchase(
-                    username, request, ticketResponse.TicketUid,
-                    paidByBonuses, paidByMoney, bonusToAdd);
-            }
-            catch (Exception bonusEx)
-            {
-                _logger.LogError(bonusEx, "Failed to update bonus system, rolling back ticket creation");
-
-                // Rollback ticket creation
-                await _ticketClient.CancelTicketAsync(username, ticketResponse.TicketUid);
-
-                throw new Exception("Purchase failed: bonus system unavailable", bonusEx);
-            }
-
-            // 6. Получить обновленную информацию о бонусах
-            var updatedPrivilege = await _bonusClient.GetPrivilegeShortInfoAsync(username);
-
-            // 7. Вернуть ответ в ожидаемом формате
-            return new TicketPurchaseResponse
-            {
-                TicketUid = ticketResponse.TicketUid,
-                FlightNumber = flight.FlightNumber,
-                FromAirport = flight.FromAirport.City + " " + flight.FromAirport.Name,
-                ToAirport = flight.ToAirport.City + " " + flight.ToAirport.Name,
-                Date = flight.Date,
-                Price = request.Price,
-                PaidByMoney = paidByMoney,
-                PaidByBonuses = paidByBonuses,
-                Status = "PAID",
-                Privilege = updatedPrivilege ?? new PrivilegeShortInfo()
-            };
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error purchasing ticket for user: {Username}", username);
-            return null;
-        }
-    }
-
-    public async Task<bool> CancelTicketAsync(string username, Guid ticketUid)
-    {
-        // 1. Отменяем билет
-        var success = await _ticketClient.CancelTicketAsync(username, ticketUid);
-        if (!success)
-        {
-            return false;
-        }
-
-        // 2. Обновляем бонусный счет
-        try
-        {
-            // 2. Update bonus system - if fails, add to retry queue
-            await _bonusClient.UpdatePrivilegeAfterCancel(username, ticketUid);
-        }
-        catch (Exception ex)
-        {
-            _logger.LogWarning(ex, "Bonus service unavailable for cancel operation, adding to retry queue");
-
-            // Add to retry queue - user gets success response anyway
-            _retryQueue.Enqueue(new RetryItem
-            {
-                OperationType = "UpdatePrivilegeAfterCancel",
-                Username = username,
-                Data = new CancelData { TicketUid = ticketUid }
-            });
-        }
-
-        return true;
-    }
-
-    public async Task<PrivilegeInfoResponse?> GetPrivilegeInfoAsync(string username)
-    {
-        try
-        {
-            return await _bonusClient.GetPrivilegeInfoAsync(username);
-        }
-        catch (ServiceUnavailableException)
-        {
-            // Пробрасываем исключение дальше - этот метод критичный
-            throw;
-        }
-        catch (Exception ex)
-        {
-            _logger.LogError(ex, "Error in GetPrivilegeInfoAsync for user: {Username}", username);
-            throw new ServiceUnavailableException("Bonus service unavailable", ex);
-        }
     }
 
     private int CalculateBonusToAdd(int price, string status)
     {
-        // 10% от стоимости билета
         return (int)(price * 0.1);
     }
 
-    private int CalculatePaidAmounts(TicketPurchaseRequest request, PrivilegeShortInfo? privilege, out int paidByBonuses, out int paidByMoney, out int bonusToAdd)
+    private void CalculatePaidAmounts(TicketPurchaseRequest request, PrivilegeShortInfo? privilege, 
+        out int paidByBonuses, out int paidByMoney, out int bonusToAdd)
     {
         paidByBonuses = 0;
         paidByMoney = request.Price;
@@ -345,14 +292,10 @@ public class GatewayService : IGatewayService
 
         if (request.PaidFromBalance && privilege != null)
         {
-            // Логика оплаты бонусами
             paidByBonuses = Math.Min(privilege.Balance, request.Price);
             paidByMoney = request.Price - paidByBonuses;
         }
 
-        // Начисление бонусов (10% от стоимости)
         bonusToAdd = CalculateBonusToAdd(request.Price, privilege?.Status ?? "BRONZE");
-
-        return paidByMoney;
     }
 }
