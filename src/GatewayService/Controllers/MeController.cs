@@ -29,7 +29,17 @@ public class MeController : ControllerBase
         
         if (response.IsSuccess)
         {
-            return Ok(response.Response);
+            var userInfo = response.Response;
+            if (userInfo?.Privilege != null && userInfo.Privilege.Balance == 0 && userInfo.Privilege.Status == "BRONZE")
+            {
+                // Заменяем privilege на пустой объект
+                return Ok(new
+                {
+                    tickets = userInfo.Tickets,
+                    privilege = "" // Пустой объект вместо {balance: 0, status: "BRONZE"}
+                });
+            }
+            return Ok(userInfo);
         }
         
         var errorMessage = response.Error?.Message ?? "Service error";

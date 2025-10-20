@@ -60,7 +60,16 @@ public class GatewayService : IGatewayService
 
         // 3. Privilege - всегда fallback при ошибках
         var privilegeResponse = await _bonusClient.GetPrivilegeShortInfoAsync(username);
-        var privilege = privilegeResponse.Response ?? new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
+        PrivilegeShortInfo privilege;
+        if (privilegeResponse.IsFallback || !privilegeResponse.IsSuccess)
+        {
+            // BonusService недоступен - возвращаем пустой privilege
+            privilege = new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
+        }
+        else
+        {
+            privilege = privilegeResponse.Response ?? new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
+        }
 
         return ServiceResponse<UserInfoResponse>.Success(new UserInfoResponse
         {
@@ -165,7 +174,7 @@ public class GatewayService : IGatewayService
                 await _ticketClient.CancelTicketAsync(username, ticket.TicketUid);
                 
                 return ServiceResponse<TicketPurchaseResponse?>.ErrorResponse(
-                    "Bonus service unavailable, purchase rolled back", 503);
+                    "Bonus Service unavailable, purchase rolled back", 503);
             }
 
             // 6. Получить обновленные бонусы (не критично)

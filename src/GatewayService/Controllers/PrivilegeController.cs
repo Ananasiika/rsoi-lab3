@@ -36,7 +36,7 @@ public class PrivilegeController : ControllerBase
         // Для /api/v1/privilege возвращаем 503 при недоступности BonusService
         if (response.StatusCode == 503)
         {
-            return StatusCode(503, new { message = "Bonus service unavailable" });
+            return StatusCode(503, new { message = "Bonus Service unavailable" });
         }
         
         var errorMessage = response.Error?.Message ?? "Service error";

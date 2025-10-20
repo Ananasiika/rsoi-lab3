@@ -21,7 +21,7 @@ public class ServiceResponse<T>
     public static ServiceResponse<T> ErrorResponse(string message, int statusCode = 500) 
         => new(default, statusCode, new ErrorDto(message));
     public static ServiceResponse<T> ServiceUnavailable(string serviceName) 
-        => new(default, 503, new ErrorDto($"{serviceName} service unavailable"), true);
+        => new(default, 503, new ErrorDto($"{serviceName} Service unavailable"), true);
     public string GetErrorMessage() => Error?.Message ?? "Unknown error";
 }
 
