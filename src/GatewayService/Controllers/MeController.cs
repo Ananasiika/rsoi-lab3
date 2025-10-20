@@ -30,6 +30,11 @@ public class MeController : ControllerBase
             var userInfo = await _gatewayService.GetUserInfoAsync(username);
             return Ok(userInfo);
         }
+        catch (ServiceUnavailableException ex)
+        {
+            _logger.LogWarning(ex, "Critical service unavailable for user: {Username}", username);
+            return StatusCode(503, new { message = "Service unavailable" });
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "Error getting user info for: {Username}", username);

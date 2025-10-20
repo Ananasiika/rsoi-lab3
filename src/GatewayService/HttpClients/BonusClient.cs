@@ -19,41 +19,57 @@ public class BonusClient : IBonusClient
 
     public async Task<PrivilegeInfoResponse?> GetPrivilegeInfoAsync(string username)
     {
-        return await _circuitBreaker.ExecuteAsync(
-            "BonusService",
-            async () =>
-            {
-                var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/privilege");
-                request.Headers.Add("X-User-Name", username);
-
-                var response = await _httpClient.SendAsync(request);
-                if (response.IsSuccessStatusCode)
+        try
+        {
+            return await _circuitBreaker.ExecuteAsync(
+                "BonusService",
+                async () =>
                 {
-                    var content = await response.Content.ReadAsStringAsync();
-                    return JsonSerializer.Deserialize<PrivilegeInfoResponse>(content, new JsonSerializerOptions
-                    {
-                        PropertyNameCaseInsensitive = true
-                    });
-                }
+                    var request = new HttpRequestMessage(HttpMethod.Get, "/api/v1/privilege");
+                    request.Headers.Add("X-User-Name", username);
 
-                _logger.LogWarning("Failed to get privilege info for user: {Username}", username);
-                throw new HttpRequestException($"Failed to get privilege info: {response.StatusCode}");
-            },
-            () =>
-            {
-                _logger.LogWarning("Using fallback for GetPrivilegeInfoAsync for user: {Username}", username);
-                return null;
-            });
+                    var response = await _httpClient.SendAsync(request);
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var content = await response.Content.ReadAsStringAsync();
+                        return JsonSerializer.Deserialize<PrivilegeInfoResponse>(content, new JsonSerializerOptions
+                        {
+                            PropertyNameCaseInsensitive = true
+                        });
+                    }
+                    
+                    _logger.LogWarning("Failed to get privilege info for user: {Username}", username);
+                    throw new HttpRequestException($"Failed to get privilege info: {response.StatusCode}");
+                },
+                () => throw new ServiceUnavailableException("Bonus service unavailable"));
+        }
+        catch (ServiceUnavailableException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Unexpected error in GetPrivilegeInfoAsync for user: {Username}", username);
+            throw new ServiceUnavailableException("Bonus service unavailable", ex);
+        }
     }
 
     public async Task<PrivilegeShortInfo?> GetPrivilegeShortInfoAsync(string username)
     {
-        var privilegeInfo = await GetPrivilegeInfoAsync(username);
-        return privilegeInfo != null ? new PrivilegeShortInfo
+        try
         {
-            Balance = privilegeInfo.Balance,
-            Status = privilegeInfo.Status
-        } : null;
+            var privilegeInfo = await GetPrivilegeInfoAsync(username);
+            return privilegeInfo != null ? new PrivilegeShortInfo
+            {
+                Balance = privilegeInfo.Balance,
+                Status = privilegeInfo.Status
+            } : null;
+        }
+        catch (ServiceUnavailableException)
+        {
+            _logger.LogWarning("Bonus service unavailable for GetPrivilegeShortInfoAsync, returning null");
+            return null;
+        }
     }
 
     public async Task UpdatePrivilegeAfterPurchase(string username, TicketPurchaseRequest request, Guid ticketUid, int paidByBonuses, int paidByMoney, int bonusToAdd = 0)

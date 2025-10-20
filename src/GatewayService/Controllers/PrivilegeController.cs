@@ -29,14 +29,11 @@ public class PrivilegeController : ControllerBase
         try
         {
             var privilegeInfo = await _gatewayService.GetPrivilegeInfoAsync(username);
-
-            // ВСЕГДА возвращаем 200, даже если пользователь новый
-            return Ok(privilegeInfo ?? new PrivilegeInfoResponse
-            {
-                Balance = 0,
-                Status = "BRONZE",
-                History = new List<BalanceHistory>()
-            });
+            return Ok(privilegeInfo ?? new PrivilegeInfoResponse { Balance = 0, Status = "BRONZE", History = new List<BalanceHistory>() });
+        }
+        catch (ServiceUnavailableException)
+        {
+            return StatusCode(503, new { message = "Bonus service unavailable" });
         }
         catch (Exception ex)
         {

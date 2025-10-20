@@ -33,55 +33,105 @@ public class GatewayService : IGatewayService
 
     public async Task<UserInfoResponse> GetUserInfoAsync(string username)
     {
-        var tickets = await _ticketClient.GetUserTicketsAsync(username);
+        List<TicketResponse> tickets;
+        try
+        {
+            tickets = await _ticketClient.GetUserTicketsAsync(username);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Ticket service unavailable for user: {Username}", username);
+            throw new ServiceUnavailableException("Ticket service unavailable", ex);
+        }
         var result = new List<TicketResponse>();
 
         foreach (var ticket in tickets)
         {
-            // 2. Для каждого билета получаем информацию о рейсе из FlightService
-            var flight = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
-
-            if (flight != null)
+            // 2. Flight info - критичный, но с fallback
+            try
             {
-                var ticketResponse = new TicketResponse
+                var flight = await _flightClient.GetFlightByNumberAsync(ticket.FlightNumber);
+                if (flight != null)
                 {
-                    TicketUid = ticket.TicketUid,
-                    FlightNumber = ticket.FlightNumber,
-                    FromAirport = $"{flight.FromAirport.City} {flight.FromAirport.Name}",
-                    ToAirport = $"{flight.ToAirport.City} {flight.ToAirport.Name}",
-                    Date = flight.Date,
-                    Price = ticket.Price,
-                    Status = ticket.Status
-                };
-                result.Add(ticketResponse);
+                    result.Add(CreateTicketResponse(ticket, flight));
+                }
+                else
+                {
+                    result.Add(CreateFallbackTicketResponse(ticket));
+                }
             }
-            else
+            catch (Exception ex)
             {
-                // Если информация о рейсе не найдена, возвращаем базовую информацию
-                var ticketResponse = new TicketResponse
-                {
-                    TicketUid = ticket.TicketUid,
-                    FlightNumber = ticket.FlightNumber,
-                    FromAirport = "Unknown",
-                    ToAirport = "Unknown",
-                    Date = DateTime.MinValue,
-                    Price = ticket.Price,
-                    Status = ticket.Status
-                };
-                result.Add(ticketResponse);
+                _logger.LogWarning(ex, "Flight service unavailable for ticket: {TicketUid}, using fallback", ticket.TicketUid);
+                result.Add(CreateFallbackTicketResponse(ticket));
             }
         }
-        var privilege = await _bonusClient.GetPrivilegeShortInfoAsync(username);
+
+        // 3. Privilege - НЕ критичный, всегда fallback при ошибках
+        PrivilegeShortInfo privilege;
+        try
+        {
+            var privilegeInfo = await _bonusClient.GetPrivilegeShortInfoAsync(username);
+            privilege = new PrivilegeShortInfo
+            {
+                Balance = privilegeInfo?.Balance ?? 0,
+                Status = privilegeInfo?.Status ?? "BRONZE"
+            };
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Bonus service unavailable for user: {Username}, using fallback", username);
+            privilege = new PrivilegeShortInfo { Balance = 0, Status = "BRONZE" };
+        }
 
         return new UserInfoResponse
         {
             Tickets = result,
-            Privilege = new PrivilegeShortInfo
-            {
-                Balance = privilege?.Balance ?? 0,
-                Status = privilege?.Status ?? "BRONZE"
-            }
+            Privilege = privilege
         };
+    }
+    private TicketResponse CreateTicketResponse(TicketResponse ticket, FlightDto flight)
+    {
+        return new TicketResponse
+        {
+            TicketUid = ticket.TicketUid,
+            FlightNumber = ticket.FlightNumber,
+            FromAirport = FormatAirport(flight.FromAirport),
+            ToAirport = FormatAirport(flight.ToAirport),
+            Date = flight.Date,
+            Price = ticket.Price,
+            Status = ticket.Status
+        };
+    }
+
+    private TicketResponse CreateFallbackTicketResponse(TicketResponse ticket)
+    {
+        return new TicketResponse
+        {
+            TicketUid = ticket.TicketUid,
+            FlightNumber = ticket.FlightNumber,
+            FromAirport = "Unknown Airport",
+            ToAirport = "Unknown Airport", 
+            Date = DateTime.MinValue,
+            Price = ticket.Price,
+            Status = ticket.Status
+        };
+    }
+
+    private string FormatAirport(AirportDto airport)
+    {
+        if (airport == null)
+            return "Unknown Airport";
+    
+        var parts = new List<string>();
+    
+        if (!string.IsNullOrEmpty(airport.City))
+            parts.Add(airport.City);
+        
+        if (!string.IsNullOrEmpty(airport.Name))
+            parts.Add(airport.Name);
+    
+        return parts.Any() ? string.Join(" ", parts) : "Unknown Airport";
     }
 
     public async Task<List<TicketResponse>> GetUserTicketsAsync(string username)
@@ -263,9 +313,22 @@ public class GatewayService : IGatewayService
         return true;
     }
 
-    public Task<PrivilegeInfoResponse?> GetPrivilegeInfoAsync(string username)
+    public async Task<PrivilegeInfoResponse?> GetPrivilegeInfoAsync(string username)
     {
-        return _bonusClient.GetPrivilegeInfoAsync(username);
+        try
+        {
+            return await _bonusClient.GetPrivilegeInfoAsync(username);
+        }
+        catch (ServiceUnavailableException)
+        {
+            // Пробрасываем исключение дальше - этот метод критичный
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error in GetPrivilegeInfoAsync for user: {Username}", username);
+            throw new ServiceUnavailableException("Bonus service unavailable", ex);
+        }
     }
 
     private int CalculateBonusToAdd(int price, string status)
